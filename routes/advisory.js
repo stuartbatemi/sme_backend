@@ -1,0 +1,194 @@
+// routes/advisory.js
+// Handles: POST /api/advisory/predict
+//
+// FLOW:
+//   1. Receive request from React
+//   2. If user is Premium (has valid JWT), note their user_id
+//   3. Forward the payload to FastAPI model server
+//   4. If Premium user, save result to advisory_sessions table
+//   5. Return result to React
+
+const express = require('express');
+const axios   = require('axios');
+const db      = require('../db');
+const { requireAuth } = require('../middleware/auth');
+require('dotenv').config();
+
+const router = express.Router();
+const FASTAPI = process.env.FASTAPI_URL || 'http://127.0.0.1:8000';
+
+
+// ── POST /api/advisory/predict ────────────────────────────────────
+// Works for BOTH Regular (no token) and Premium (with token) users.
+// Regular: result returned, nothing saved.
+// Premium: result returned AND saved to DB.
+router.post('/predict', async (req, res) => {
+    const { path_type, business_idea, ...payload } = req.body;
+    // path_type: 'A' or 'B'
+
+    if (!['A', 'B'].includes(path_type)) {
+        return res.status(400).json({ error: "path_type must be 'A' or 'B'" });
+    }
+
+    // Detect if this is a Premium user (optional auth)
+    let userId = null;
+    let userTier = 'regular';
+    const authHeader = req.headers['authorization'];
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        try {
+            const { verifyAccessToken } = require('../utils/jwt');
+            const payload_jwt = verifyAccessToken(authHeader.split(' ')[1]);
+            userId = payload_jwt.userId;
+            userTier = payload_jwt.tier;
+        } catch (_) {
+            // Token invalid/expired — treat as regular user, don't block
+        }
+    }
+
+    // Forward to FastAPI
+    const endpoint = path_type === 'A' ? '/predict/path-a' : '/predict/path-b';
+    let result;
+    try {
+        const response = await axios.post(`${FASTAPI}${endpoint}`, payload, {
+            timeout: 30000,   // 30 second timeout
+            headers: { 'Content-Type': 'application/json' }
+        });
+        result = response.data;
+    } catch (err) {
+        if (err.code === 'ECONNREFUSED') {
+            return res.status(503).json({ error: 'Advisory model is offline. Please try again shortly.' });
+        }
+        if (err.response) {
+            return res.status(err.response.status).json(err.response.data);
+        }
+        console.error('FastAPI error:', err.message);
+        return res.status(500).json({ error: 'Prediction failed. Please try again.' });
+    }
+
+    // Save to DB if Premium user
+    if (userId && userTier === 'premium') {
+        try {
+            // Extract quick-access fields from result
+            let success_chance = null, monthly_profit = null,
+                roi_percent = null, breakeven_months = null;
+
+            if (path_type === 'A') {
+                success_chance   = result.success_chance   || null;
+                monthly_profit   = result.expected_monthly_profit_tzs || null;
+                roi_percent      = result.roi_percent_per_year || null;
+                breakeven_months = result.breakeven_months  || null;
+            } else {
+                // Path B: take the first/top recommendation's values
+                const top = result.recommendations?.[0];
+                if (top) {
+                    success_chance   = top.success_chance || null;
+                    monthly_profit   = top.expected_monthly_profit_tzs || null;
+                    roi_percent      = top.roi_percent_per_year || null;
+                    breakeven_months = top.breakeven_months || null;
+                }
+            }
+
+            await db.query(
+                `INSERT INTO advisory_sessions
+                 (user_id, path_type, business_idea, district, ward, village,
+                  capital_tzs, age_at_query, gender, isic_code,
+                  result_json, success_chance, monthly_profit, roi_percent, breakeven_months)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    userId,
+                    path_type,
+                    business_idea || null,
+                    payload.district || null,
+                    payload.ward || null,
+                    payload.village || null,
+                    payload.capital_tzs || null,
+                    payload.age || null,
+                    payload.gender || null,
+                    payload.isic_detailed || null,
+                    JSON.stringify(result),
+                    success_chance,
+                    monthly_profit,
+                    roi_percent,
+                    breakeven_months,
+                ]
+            );
+        } catch (dbErr) {
+            // Don't fail the request if DB save fails — just log it
+            console.error('Failed to save advisory session:', dbErr.message);
+        }
+    }
+
+    return res.status(200).json({
+        ...result,
+        saved: userId && userTier === 'premium' ? true : false,
+    });
+});
+
+
+// ── GET /api/advisory/history ─────────────────────────────────────
+// Premium only — returns this user's past advisory sessions.
+router.get('/history', requireAuth, async (req, res) => {
+    if (req.user.tier !== 'premium') {
+        return res.status(403).json({
+            error: 'Premium subscription required to view history.'
+        });
+    }
+
+    const page  = parseInt(req.query.page)  || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
+
+    try {
+        const [rows] = await db.query(
+            `SELECT id, path_type, business_idea, district, ward,
+                    capital_tzs, success_chance, monthly_profit,
+                    roi_percent, breakeven_months, created_at
+             FROM advisory_sessions
+             WHERE user_id = ?
+             ORDER BY created_at DESC
+             LIMIT ? OFFSET ?`,
+            [req.user.userId, limit, offset]
+        );
+
+        const [[{ total }]] = await db.query(
+            'SELECT COUNT(*) as total FROM advisory_sessions WHERE user_id = ?',
+            [req.user.userId]
+        );
+
+        return res.status(200).json({
+            sessions: rows,
+            pagination: { page, limit, total, pages: Math.ceil(total / limit) }
+        });
+
+    } catch (err) {
+        console.error('History error:', err);
+        return res.status(500).json({ error: 'Failed to fetch history.' });
+    }
+});
+
+
+// ── GET /api/advisory/history/:id ────────────────────────────────
+// Returns a specific session's FULL result_json for Premium users.
+router.get('/history/:id', requireAuth, async (req, res) => {
+    if (req.user.tier !== 'premium') {
+        return res.status(403).json({ error: 'Premium required.' });
+    }
+
+    try {
+        const [rows] = await db.query(
+            'SELECT * FROM advisory_sessions WHERE id = ? AND user_id = ?',
+            [req.params.id, req.user.userId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Session not found.' });
+        }
+
+        return res.status(200).json(rows[0]);
+
+    } catch (err) {
+        return res.status(500).json({ error: 'Failed to fetch session.' });
+    }
+});
+
+module.exports = router;
