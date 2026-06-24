@@ -21,15 +21,16 @@ const PORT = process.env.PORT || 5000;
 
 // CORS — allow React (port 3000 or 5173) to call this server
 app.use(cors({
-    origin: [
-        'http://localhost:3000',   // Create React App default
-        'http://localhost:5173',   // Vite default
-        'http://127.0.0.1:3000',
-        'http://127.0.0.1:5173',
-    ],
-    credentials: true,
+  origin: [
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:5173',
+    'https://sme-frontend-ecru.vercel.app',   // ← add your Vercel URL
+    /\.vercel\.app$/,   // or allow all vercel previews
+  ],
+  credentials: true,
 }));
-
 app.use(express.json({ limit: '10kb' }));       // parse JSON, max 10kb per request
 app.use(express.urlencoded({ extended: true }));
 
