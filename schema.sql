@@ -122,6 +122,46 @@ CREATE TABLE IF NOT EXISTS payments (
 
 
 -- ----------------------------------------------------------------
+-- TABLE 5: login_events
+-- A log of every login attempt (successful AND failed), every
+-- registration, and every logout — so you can see real activity on
+-- the app as it happens, just by querying this table, e.g.:
+--
+--   -- who's logged in in the last 15 minutes
+--   SELECT * FROM login_events
+--   WHERE event_type = 'login_success' AND created_at > NOW() - INTERVAL 15 MINUTE
+--   ORDER BY created_at DESC;
+--
+--   -- failed login attempts in the last hour (security check)
+--   SELECT email_attempted, COUNT(*) as attempts, MAX(created_at) as last_attempt
+--   FROM login_events
+--   WHERE event_type = 'login_failed' AND created_at > NOW() - INTERVAL 1 HOUR
+--   GROUP BY email_attempted ORDER BY attempts DESC;
+--
+-- user_id is NULLABLE on purpose: a failed login for an email that
+-- isn't even a registered user (typo, or someone probing emails)
+-- still gets logged, but there's no real user_id to attach it to.
+-- ----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS login_events (
+    id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id         INT UNSIGNED    DEFAULT NULL,       -- NULL if email didn't match any account
+    email_attempted VARCHAR(255)    DEFAULT NULL,       -- what was typed, even if it failed
+    event_type      ENUM('login_success','login_failed','register','logout') NOT NULL,
+    fail_reason     VARCHAR(100)    DEFAULT NULL,       -- e.g. 'invalid_password', 'unknown_email', 'account_deactivated'
+    tier_at_event   ENUM('regular','premium') DEFAULT NULL,  -- snapshot of tier at the moment of this event
+    ip_address      VARCHAR(45)     DEFAULT NULL,       -- IPv4 or IPv6
+    user_agent      VARCHAR(255)    DEFAULT NULL,       -- browser/device string from the request
+    created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+    INDEX idx_user_id    (user_id),
+    INDEX idx_event_type (event_type),
+    INDEX idx_created_at (created_at),
+    INDEX idx_email      (email_attempted)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- ----------------------------------------------------------------
 -- VERIFY: show all created tables
 -- ----------------------------------------------------------------
 SHOW TABLES;

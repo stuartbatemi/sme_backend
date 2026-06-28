@@ -17,6 +17,13 @@ require('./db');
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
+// Railway (and most hosts) sit behind a reverse proxy, so without this,
+// req.ip would return the proxy's internal IP for every request instead
+// of the real visitor's IP — which would make the IP column in
+// login_events useless. "1" trusts exactly one hop of proxy, which
+// matches Railway's setup.
+app.set('trust proxy', 1);
+
 // ── Middleware ────────────────────────────────────────────────────
 
 // CORS — allow React (port 3000 or 5173) to call this server

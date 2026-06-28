@@ -17,6 +17,31 @@ function hashToken(token) {
     return crypto.createHash('sha256').update(token).digest('hex');
 }
 
+// Records one row in login_events. Never throws — a logging failure
+// should never block someone from actually logging in/registering, so
+// every call site wraps this in its own try/catch and just logs to
+// the console if it fails (the request itself still succeeds).
+async function logLoginEvent(req, { userId = null, emailAttempted = null, eventType, failReason = null, tier = null }) {
+    try {
+        await db.query(
+            `INSERT INTO login_events
+             (user_id, email_attempted, event_type, fail_reason, tier_at_event, ip_address, user_agent)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+                userId,
+                emailAttempted,
+                eventType,
+                failReason,
+                tier,
+                req.ip || null,
+                (req.headers['user-agent'] || '').slice(0, 255) || null,
+            ]
+        );
+    } catch (err) {
+        console.error('logLoginEvent failed (non-fatal):', err.message);
+    }
+}
+
 // ── POST /api/auth/register ───────────────────────────────────────
 router.post('/register', [
     body('full_name').trim().isLength({ min: 2 }).withMessage('Name must be at least 2 characters'),
@@ -64,6 +89,8 @@ router.post('/register', [
             [userId, hashToken(refreshToken), expiresAt]
         );
 
+        await logLoginEvent(req, { userId, emailAttempted: email, eventType: 'register', tier: 'regular' });
+
         return res.status(201).json({
             message: 'Account created successfully.',
             user: { id: userId, full_name, email, tier: 'regular' },
@@ -97,18 +124,21 @@ router.post('/login', [
         );
 
         if (rows.length === 0) {
+            await logLoginEvent(req, { emailAttempted: email, eventType: 'login_failed', failReason: 'unknown_email' });
             return res.status(401).json({ error: 'Invalid email or password.' });
         }
 
         const user = rows[0];
 
         if (!user.is_active) {
+            await logLoginEvent(req, { userId: user.id, emailAttempted: email, eventType: 'login_failed', failReason: 'account_deactivated', tier: user.tier });
             return res.status(403).json({ error: 'Account is deactivated. Contact support.' });
         }
 
         // Check password
         const passwordMatch = await bcrypt.compare(password, user.password_hash);
         if (!passwordMatch) {
+            await logLoginEvent(req, { userId: user.id, emailAttempted: email, eventType: 'login_failed', failReason: 'invalid_password', tier: user.tier });
             return res.status(401).json({ error: 'Invalid email or password.' });
         }
 
@@ -122,6 +152,8 @@ router.post('/login', [
             'INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)',
             [user.id, hashToken(refreshToken), expiresAt]
         );
+
+        await logLoginEvent(req, { userId: user.id, emailAttempted: email, eventType: 'login_success', tier: user.tier });
 
         return res.status(200).json({
             message: 'Login successful.',
@@ -178,10 +210,31 @@ router.post('/refresh', async (req, res) => {
 router.post('/logout', async (req, res) => {
     const { refresh_token } = req.body;
     if (refresh_token) {
+        const tokenHash = hashToken(refresh_token);
+
+        // Look up which user this token belonged to BEFORE deleting it,
+        // so the logout event can be attributed to a real user_id.
+        try {
+            const [rows] = await db.query(
+                'SELECT user_id FROM refresh_tokens WHERE token_hash = ?',
+                [tokenHash]
+            );
+            if (rows.length > 0) {
+                const [userRows] = await db.query('SELECT tier FROM users WHERE id = ?', [rows[0].user_id]);
+                await logLoginEvent(req, {
+                    userId: rows[0].user_id,
+                    eventType: 'logout',
+                    tier: userRows[0]?.tier || null,
+                });
+            }
+        } catch (err) {
+            console.error('Logout event lookup failed (non-fatal):', err.message);
+        }
+
         // Delete this device's refresh token
         await db.query(
             'DELETE FROM refresh_tokens WHERE token_hash = ?',
-            [hashToken(refresh_token)]
+            [tokenHash]
         );
     }
     return res.status(200).json({ message: 'Logged out successfully.' });
