@@ -87,6 +87,37 @@ router.post('/predict', async (req, res) => {
         return res.status(500).json({ error: 'Prediction failed. Please try again.' });
     }
 
+    // ── Fetch alternatives for Low/Medium Path A results ──────────────
+    // If Path A comes back Low or Medium, we silently call /predict/path-b
+    // with the same location + capital + demographics and attach the top 5
+    // results as `alternatives` so the frontend can show better options.
+    if (path_type === 'A' && result.success_chance) {
+        const chance = String(result.success_chance).toLowerCase();
+        if (chance === 'low' || chance === 'medium') {
+            try {
+                const altPayload = {
+                    district:    payload.district,
+                    ward:        payload.ward,
+                    village:     payload.village,
+                    capital_tzs: payload.capital_tzs,
+                    age:         payload.age,
+                    gender:      payload.gender,
+                    top_n:       5,
+                };
+                const altResponse = await axios.post(
+                    `${modelBaseUrl}/predict/path-b`,
+                    altPayload,
+                    { timeout: 30000, headers: { 'Content-Type': 'application/json' } }
+                );
+                result.alternatives = altResponse.data?.recommendations || [];
+            } catch (altErr) {
+                // Non-critical — don't fail the main result if alternatives fetch fails
+                console.error('Alternatives fetch failed:', altErr.message);
+                result.alternatives = [];
+            }
+        }
+    }
+
     // Save to DB if Premium user
     if (userId && userTier === 'premium') {
         try {
