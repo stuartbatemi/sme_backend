@@ -1,0 +1,99 @@
+name: Database Backup
+
+# Runs automatically every day at 02:00 UTC (~05:00 EAT / Dar es Salaam time).
+# Also runnable manually any time from GitHub → Actions tab → "Run workflow".
+#
+# WHY A SEPARATE BRANCH, NOT main:
+# Railway and Vercel are both set up to auto-deploy on pushes to `main`.
+# This workflow pushes to a dedicated `db-backups` branch instead, so it
+# can NEVER trigger a redeploy of your live app — completely isolated
+# from production, exactly as intended.
+#
+# WHAT YOU NEED TO SET UP ONCE (see the message in chat for full steps):
+#   Repo → Settings → Secrets and variables → Actions → New repository secret
+#     DB_HOST      (Railway's PUBLIC MySQL host — Actions runs outside Railway's network)
+#     DB_PORT
+#     DB_USER
+#     DB_PASSWORD
+#     DB_NAME
+#
+# No other setup needed — this uses GitHub's own built-in token to push,
+# so there's no extra password to create or leak.
+
+"on":
+  schedule:
+    - cron: '0 2 * * *'   # every day at 02:00 UTC
+  workflow_dispatch: {}     # lets you click "Run workflow" manually too
+
+permissions:
+  contents: write   # needed to push the backup file to the db-backups branch
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history to create/switch branches cleanly
+
+      - name: Install MySQL client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mysql-client
+
+      - name: Dump database
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%d_%H%M%S")
+          FILENAME="sme_project_${TIMESTAMP}.sql.gz"
+
+          # Dumped to /tmp, OUTSIDE the git working tree — this way, whatever
+          # the next step does with branches/checkouts can never touch it.
+          mysqldump \
+            --host="$DB_HOST" \
+            --port="$DB_PORT" \
+            --user="$DB_USER" \
+            --password="$DB_PASSWORD" \
+            --single-transaction \
+            --routines \
+            --triggers \
+            --column-statistics=0 \
+            "$DB_NAME" | gzip > "/tmp/$FILENAME"
+
+          echo "BACKUP_FILENAME=$FILENAME" >> "$GITHUB_ENV"
+          echo "Backup created: /tmp/$FILENAME ($(du -h "/tmp/$FILENAME" | cut -f1))"
+
+      - name: Commit backup to db-backups branch
+        run: |
+          git config user.name "db-backup-bot"
+          git config user.email "actions@github.com"
+
+          # Create/switch to db-backups branch without disturbing main.
+          # If it doesn't exist yet, this creates it the FIRST time only,
+          # then reuses it every day after.
+          if git ls-remote --exit-code --heads origin db-backups > /dev/null 2>&1; then
+            git fetch origin db-backups
+            git checkout db-backups
+          else
+            git checkout --orphan db-backups
+            git rm -rf . > /dev/null 2>&1 || true
+          fi
+
+          mkdir -p db-backups
+          cp "/tmp/$BACKUP_FILENAME" "db-backups/$BACKUP_FILENAME"
+
+          git add db-backups/
+          git commit -m "Automated backup: $BACKUP_FILENAME" || echo "Nothing new to commit"
+          git push origin db-backups
+
+      - name: Delete backups older than 30 days
+        run: |
+          git checkout db-backups
+          find db-backups -name "*.sql.gz" -mtime +30 -delete
+          git add db-backups/
+          git commit -m "Prune backups older than 30 days" || echo "Nothing to prune"
+          git push origin db-backups

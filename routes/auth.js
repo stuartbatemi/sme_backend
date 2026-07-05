@@ -118,6 +118,22 @@ router.post('/login', [
     const { email, password } = req.body;
 
     try {
+        // Account-level lockout: this catches brute-force attempts that
+        // spread requests across many IPs to dodge the IP-based rate
+        // limiter above. 8 failed attempts on THIS email in 15 minutes
+        // blocks further tries regardless of which IP they come from.
+        const [[{ recentFailures }]] = await db.query(
+            `SELECT COUNT(*) AS recentFailures FROM login_events
+             WHERE email_attempted = ? AND event_type = 'login_failed'
+               AND created_at > (NOW() - INTERVAL 15 MINUTE)`,
+            [email]
+        );
+        if (recentFailures >= 8) {
+            return res.status(429).json({
+                error: 'Too many failed login attempts on this account. Please wait 15 minutes and try again.'
+            });
+        }
+
         const [rows] = await db.query(
             'SELECT id, full_name, email, password_hash, tier, is_active FROM users WHERE email = ?',
             [email]

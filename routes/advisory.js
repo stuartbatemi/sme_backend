@@ -12,6 +12,7 @@ const express = require('express');
 const axios   = require('axios');
 const db      = require('../db');
 const { requireAuth } = require('../middleware/auth');
+const cache   = require('../utils/cache');
 require('dotenv').config();
 
 const router = express.Router();
@@ -222,8 +223,18 @@ router.get('/history/:id', requireAuth, async (req, res) => {
 router.get('/districts', async (req, res) => {
     const { userTier } = identifyUser(req);
     const modelBaseUrl = resolveModelBaseUrl(userTier);
+    const cacheKey = `districts:${userTier}`;
+
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        res.set('Cache-Control', 'public, max-age=300');
+        return res.status(200).json(cached);
+    }
+
     try {
         const response = await axios.get(`${modelBaseUrl}/districts`, { timeout: 10000 });
+        cache.set(cacheKey, response.data, 10 * 60 * 1000); // 10 min — this list basically never changes
+        res.set('Cache-Control', 'public, max-age=300');
         return res.status(200).json(response.data);
     } catch (err) {
         if (err.code === 'ECONNREFUSED') {
@@ -244,11 +255,22 @@ router.get('/districts', async (req, res) => {
 router.get('/activities', async (req, res) => {
     const { userTier } = identifyUser(req);
     const modelBaseUrl = resolveModelBaseUrl(userTier);
+    const sector = req.query.sector || '';
+    const cacheKey = `activities:${userTier}:${sector}`;
+
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        res.set('Cache-Control', 'public, max-age=300');
+        return res.status(200).json(cached);
+    }
+
     try {
         const response = await axios.get(`${modelBaseUrl}/activities`, {
             timeout: 10000,
-            params: req.query.sector ? { sector: req.query.sector } : {},
+            params: sector ? { sector } : {},
         });
+        cache.set(cacheKey, response.data, 10 * 60 * 1000);
+        res.set('Cache-Control', 'public, max-age=300');
         return res.status(200).json(response.data);
     } catch (err) {
         if (err.code === 'ECONNREFUSED') {
