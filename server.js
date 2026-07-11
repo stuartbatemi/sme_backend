@@ -13,7 +13,8 @@ const jwt         = require('jsonwebtoken');
 const authRoutes     = require('./routes/auth');
 const advisoryRoutes = require('./routes/advisory');
 const userRoutes     = require('./routes/user');
-
+const consultantRoutes  = require('./routes/consultant');    // ADD THIS
+const microfinanceRoutes = require('./routes/microfinance'); // ADD THIS
 // Initialize DB connection pool (runs on import)
 require('./db');
 
@@ -44,7 +45,7 @@ app.disable('x-powered-by');
 // cheaper on Railway's metered egress.
 app.use(compression());
 
-// CORS — allow React (port 3000 or 5173) to call this server.
+// CORS — allow React (port 3001 or 5173) to call this server.
 // We use Bearer tokens in the Authorization header, not cookies, so
 // `credentials: true` isn't needed here — leaving it off closes off
 // a class of cross-site request issues entirely.
@@ -54,9 +55,9 @@ app.use(compression());
 // preview deployments instead (sme-frontend-<hash>.vercel.app).
 app.use(cors({
   origin: [
-    'http://localhost:3000',
+    'http://localhost:3001',
     'http://localhost:5173',
-    'http://127.0.0.1:3000',
+    'http://127.0.0.1:3001',
     'http://127.0.0.1:5173',
     'https://sme-frontend-ecru.vercel.app',
     /^https:\/\/sme-frontend-[a-z0-9-]+\.vercel\.app$/,  // your project's preview URLs only
@@ -135,7 +136,8 @@ app.use(generalLimiter);
 app.use('/api/auth',     authRoutes);
 app.use('/api/advisory', advisoryRoutes);
 app.use('/api/user',     userRoutes);
-
+app.use('/api/consultant',  consultantRoutes);    // ADD THIS
+app.use('/api/microfinance', microfinanceRoutes); // ADD THIS
 // Health check — quick test that Node is running
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', service: 'SME Advisory Node Gateway', port: PORT });

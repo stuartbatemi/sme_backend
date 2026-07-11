@@ -55,11 +55,25 @@ function identifyUser(req) {
 // Regular: result returned, nothing saved.
 // Premium: result returned AND saved to DB.
 router.post('/predict', async (req, res) => {
-    const { path_type, business_idea, ...payload } = req.body;
+    const { path_type, business_idea, funding_type, prior_experience, ...payload } = req.body;
     // path_type: 'A' or 'B'
+    // funding_type (optional): 'personal' | 'loan' | 'expansion'
+    // prior_experience (optional, only meaningful when funding_type === 'expansion'):
+    //   [{ isic_detailed: 4711, years: 3, still_active: true }, ...]
 
     if (!['A', 'B'].includes(path_type)) {
         return res.status(400).json({ error: "path_type must be 'A' or 'B'" });
+    }
+    if (funding_type && !['personal', 'loan', 'expansion'].includes(funding_type)) {
+        return res.status(400).json({ error: "funding_type must be 'personal', 'loan', or 'expansion'" });
+    }
+
+    // For Path B, if the person has prior business experience, pass the
+    // ISIC codes through so the model can boost matching-sector results.
+    if (path_type === 'B' && Array.isArray(prior_experience) && prior_experience.length > 0) {
+        payload.prior_experience_isic = prior_experience
+            .map(e => e.isic_detailed)
+            .filter(code => Number.isInteger(code));
     }
 
     // Detect if this is a Premium user (optional auth) — Premium users get
@@ -86,6 +100,42 @@ router.post('/predict', async (req, res) => {
         console.error('FastAPI error:', err.message);
         return res.status(500).json({ error: 'Prediction failed. Please try again.' });
     }
+
+    // ── Capital below minimum: model already short-circuited (result.blocked
+    // === true) and did NOT run a prediction. Skip alternatives-fetch and
+    // DB save below — nothing to save, just pass the message straight through.
+    if (result.blocked) {
+        return res.status(200).json({
+            ...result,
+            saved: false,
+            model_tier: userTier === 'premium' ? 'premium' : 'regular',
+        });
+    }
+
+    // ── Risk tier for loan-seeking users ───────────────────────────────
+    // Simple, defensible mapping: the model's own predicted success
+    // category IS the risk signal — High predicted success = Low loan
+    // risk, and so on. Only computed/shown when the person indicated
+    // they're seeking a loan, so it doesn't clutter results for people
+    // using personal funds.
+    function successToRiskTier(chance) {
+        const c = String(chance || '').toLowerCase();
+        if (c === 'high') return 'Low';
+        if (c === 'medium') return 'Medium';
+        if (c === 'low') return 'High';
+        return null;
+    }
+    if (funding_type === 'loan') {
+        if (path_type === 'A') {
+            result.risk_tier = successToRiskTier(result.success_chance);
+        } else if (Array.isArray(result.recommendations)) {
+            result.recommendations = result.recommendations.map(r => ({
+                ...r,
+                risk_tier: successToRiskTier(r.success_chance),
+            }));
+        }
+    }
+
 
     // ── Fetch alternatives for Low/Medium Path A results ──────────────
     // If Path A comes back Low or Medium, we silently call /predict/path-b
@@ -144,9 +194,9 @@ router.post('/predict', async (req, res) => {
             await db.query(
                 `INSERT INTO advisory_sessions
                  (user_id, path_type, business_idea, district, ward, village,
-                  capital_tzs, age_at_query, gender, isic_code,
-                  result_json, success_chance, monthly_profit, roi_percent, breakeven_months)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  capital_tzs, funding_type, prior_experience, age_at_query, gender, isic_code,
+                  result_json, success_chance, risk_tier, monthly_profit, roi_percent, breakeven_months)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
                     userId,
                     path_type,
@@ -155,11 +205,14 @@ router.post('/predict', async (req, res) => {
                     payload.ward || null,
                     payload.village || null,
                     payload.capital_tzs || null,
+                    funding_type || null,
+                    prior_experience ? JSON.stringify(prior_experience) : null,
                     payload.age || null,
                     payload.gender || null,
                     payload.isic_detailed || null,
                     JSON.stringify(result),
                     success_chance,
+                    result.risk_tier || null,
                     monthly_profit,
                     roi_percent,
                     breakeven_months,
@@ -309,6 +362,33 @@ router.get('/activities', async (req, res) => {
         }
         console.error('FastAPI /activities error:', err.message);
         return res.status(500).json({ error: 'Could not fetch activities.' });
+    }
+});
+
+
+// ── GET /api/advisory/experience-search ──────────────────────────────
+// Searchable business-type lookup for the "have you owned a business
+// before?" step (funding_type === 'expansion'). Reuses the SAME
+// activity catalog as Path A's business-idea search — no new data
+// needed, just a friendlier alias so the frontend can use a distinct
+// endpoint name for this step of the flow.
+router.get('/experience-search', async (req, res) => {
+    const { userTier } = identifyUser(req);
+    const modelBaseUrl = resolveModelBaseUrl(userTier);
+    const query = req.query.q || '';
+
+    try {
+        const response = await axios.get(`${modelBaseUrl}/activities`, {
+            timeout: 10000,
+            params: query ? { search: query } : {},
+        });
+        return res.status(200).json(response.data);
+    } catch (err) {
+        if (err.code === 'ECONNREFUSED') {
+            return res.status(503).json({ error: 'Advisory model is offline. Please try again shortly.' });
+        }
+        console.error('experience-search error:', err.message);
+        return res.status(500).json({ error: 'Could not search business types.' });
     }
 });
 
