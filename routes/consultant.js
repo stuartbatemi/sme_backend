@@ -25,7 +25,10 @@ const GROQ_MODEL = 'llama-3.3-70b-versatile'; // free tier, strong reasoning, fa
 
 function buildPrompt({ activity, sector, district, ward, capital_tzs, monthly_profit,
                         success_chance, existing_similar_businesses_in_area, roi_percent,
-                        breakeven_months }) {
+                        breakeven_months, language }) {
+  const languageInstruction = language === 'sw'
+    ? 'Respond entirely in Swahili (Kiswahili) — every string value in the JSON must be in Swahili, not English.'
+    : 'Respond entirely in English.';
   return `You are a business advisor for Dar es Salaam, Tanzania SMEs. A person has been
 recommended this business:
 
@@ -44,6 +47,8 @@ The prediction above was generated from historical business-registry and census 
 like seasonality, competitor behavior, supplier reliability, regulatory changes, weather/
 rainy-season effects on foot traffic, or currency/import cost shifts.
 
+${languageInstruction}
+
 Respond in JSON only, matching this exact structure, no markdown fences, no preamble:
 {
   "three_month_outlook": "2-3 sentences on what's realistic in the first 3 months, referencing BOTH the model's factors (saturation/location/capital) and at least one real-world factor the model can't see",
@@ -56,19 +61,28 @@ Respond in JSON only, matching this exact structure, no markdown fences, no prea
 }
 
 router.post('/analyze', async (req, res) => {
+  const isSw = req.body?.language === 'sw';
+
   if (!GROQ_API_KEY) {
     return res.status(503).json({
-      error: 'AI consultant is not configured yet. Add GROQ_API_KEY to the backend .env (free key from console.groq.com).'
+      error: isSw
+        ? 'Mshauri wa AI bado hajawekwa. Ongeza GROQ_API_KEY kwenye .env ya backend (funguo bila malipo kutoka console.groq.com).'
+        : 'AI consultant is not configured yet. Add GROQ_API_KEY to the backend .env (free key from console.groq.com).'
     });
   }
 
   const {
     activity, sector, district, ward, capital_tzs, monthly_profit,
     success_chance, existing_similar_businesses_in_area, roi_percent, breakeven_months,
+    language,
   } = req.body;
 
   if (!activity || !district || capital_tzs == null || monthly_profit == null) {
-    return res.status(400).json({ error: 'Missing required fields: activity, district, capital_tzs, monthly_profit.' });
+    return res.status(400).json({
+      error: isSw
+        ? 'Taarifa zinazohitajika hazipo: activity, district, capital_tzs, monthly_profit.'
+        : 'Missing required fields: activity, district, capital_tzs, monthly_profit.'
+    });
   }
 
   try {
@@ -99,21 +113,35 @@ router.post('/analyze', async (req, res) => {
       parsed = JSON.parse(raw);
     } catch (parseErr) {
       console.error('Consultant JSON parse failed:', raw);
-      return res.status(502).json({ error: 'AI consultant returned an unexpected format. Please try again.' });
+      return res.status(502).json({
+        error: isSw
+          ? 'Mshauri wa AI amerudisha muundo usiotarajiwa. Tafadhali jaribu tena.'
+          : 'AI consultant returned an unexpected format. Please try again.'
+      });
     }
 
     return res.status(200).json({
       ...parsed,
-      generated_by: 'AI consultant (general guidance, not location-verified — cross-check before relying on it)',
+      generated_by: isSw
+        ? 'Mshauri wa AI (ushauri wa jumla, haujathibitishwa eneo — hakiki kabla ya kutegemea)'
+        : 'AI consultant (general guidance, not location-verified — cross-check before relying on it)',
     });
 
   } catch (err) {
     if (err.response) {
       console.error('Groq API error:', err.response.status, err.response.data);
-      return res.status(502).json({ error: 'AI consultant service returned an error. Please try again.' });
+      return res.status(502).json({
+        error: isSw
+          ? 'Huduma ya mshauri wa AI imerudisha hitilafu. Tafadhali jaribu tena.'
+          : 'AI consultant service returned an error. Please try again.'
+      });
     }
     console.error('Consultant route error:', err.message);
-    return res.status(500).json({ error: 'AI consultant is temporarily unavailable.' });
+    return res.status(500).json({
+      error: isSw
+        ? 'Mshauri wa AI haupatikani kwa sasa.'
+        : 'AI consultant is temporarily unavailable.'
+    });
   }
 });
 

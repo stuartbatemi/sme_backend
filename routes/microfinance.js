@@ -13,11 +13,12 @@ const router = express.Router();
 
 router.get('/', async (req, res) => {
   const riskTier = req.query.risk_tier;
+  const lang = req.query.lang === 'sw' ? 'sw' : 'en';
   if (!['Low', 'Medium', 'High'].includes(riskTier)) {
     return res.status(400).json({ error: "risk_tier must be 'Low', 'Medium', or 'High'." });
   }
 
-  const cacheKey = `microfinance:${riskTier}`;
+  const cacheKey = `microfinance:${riskTier}:${lang}`;
   const cached = cache.get(cacheKey);
   if (cached) {
     res.set('Cache-Control', 'public, max-age=3600');
@@ -27,7 +28,7 @@ router.get('/', async (req, res) => {
   try {
     const [rows] = await db.query(
       `SELECT id, name, type, min_loan_tzs, max_loan_tzs, typical_interest_note,
-              eligibility_summary, website, last_verified
+              eligibility_summary, eligibility_summary_sw, website, last_verified
        FROM microfinance_institutions
        WHERE active = TRUE AND FIND_IN_SET(?, suited_risk_tiers)
        ORDER BY
@@ -42,7 +43,16 @@ router.get('/', async (req, res) => {
       [riskTier]
     );
 
-    const payload = { risk_tier: riskTier, count: rows.length, institutions: rows };
+    // Use the Swahili summary when requested and available; otherwise
+    // fall back to English rather than showing blank/missing text.
+    const localized = rows.map(({ eligibility_summary_sw, ...row }) => ({
+      ...row,
+      eligibility_summary: lang === 'sw' && eligibility_summary_sw
+        ? eligibility_summary_sw
+        : row.eligibility_summary,
+    }));
+
+    const payload = { risk_tier: riskTier, count: localized.length, institutions: localized };
     cache.set(cacheKey, payload, 60 * 60 * 1000); // 1 hour — this reference data barely changes
     res.set('Cache-Control', 'public, max-age=3600');
     return res.status(200).json(payload);
