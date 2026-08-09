@@ -13,6 +13,7 @@ const axios   = require('axios');
 const db      = require('../db');
 const { requireAuth } = require('../middleware/auth');
 const cache   = require('../utils/cache');
+const { logActivity } = require('../utils/auditLog');
 require('dotenv').config();
 
 const router = express.Router();
@@ -259,6 +260,12 @@ router.post('/predict', async (req, res) => {
                 ]
             );
             sessionSaved = true;
+            await logActivity(req, {
+                userId,
+                action: 'advisory.predict',
+                entityType: 'advisory_session',
+                meta: { path_type, tier: userTier },
+            });
         } catch (dbErr) {
             // Don't fail the request if DB save fails — just log it.
             // `saved` stays false so the frontend/caller isn't told a

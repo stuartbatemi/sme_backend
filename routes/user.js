@@ -6,6 +6,7 @@ const db = require('../db');
 const { requireAuth } = require('../middleware/auth');
 const { generateAccessToken } = require('../utils/jwt');
 const { body, validationResult } = require('express-validator');
+const { logActivity } = require('../utils/auditLog');
 
 const router = express.Router();
 
@@ -125,6 +126,13 @@ router.post('/upgrade', requireAuth, [
             "UPDATE users SET tier = 'premium' WHERE id = ?",
             [req.user.userId]
         );
+
+        await logActivity(req, {
+            userId: req.user.userId,
+            action: 'payment.completed',
+            entityType: 'payment',
+            meta: { amount_tzs: amount_tzs || 0, method: payment_method || 'demo', demo: true },
+        });
 
         const newAccessToken = generateAccessToken(req.user.userId, 'premium');
 

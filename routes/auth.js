@@ -12,6 +12,7 @@ const { body, validationResult } = require('express-validator');
 
 const { sendMail, otpEmail, linkEmail } = require('../utils/mailer');
 const { sendSms, otpSms, normalizeTzPhone } = require('../utils/sms');
+const { logActivity } = require('../utils/auditLog');
 
 const router = express.Router();
 
@@ -144,6 +145,7 @@ router.post('/register', [
         );
 
         await logLoginEvent(req, { userId, emailAttempted: email, eventType: 'register', tier: 'regular' });
+        await logActivity(req, { userId, action: 'user.register', entityType: 'user', entityId: userId, meta: { tier: 'regular' } });
 
         return res.status(201).json({
             message: 'Account created successfully.',
@@ -224,6 +226,7 @@ router.post('/login', [
         );
 
         await logLoginEvent(req, { userId: user.id, emailAttempted: email, eventType: 'login_success', tier: user.tier });
+        await logActivity(req, { userId: user.id, action: 'user.login', entityType: 'user', entityId: user.id, meta: { tier: user.tier } });
 
         return res.status(200).json({
             message: 'Login successful.',
@@ -296,6 +299,7 @@ router.post('/logout', async (req, res) => {
                     eventType: 'logout',
                     tier: userRows[0]?.tier || null,
                 });
+                await logActivity(req, { userId: rows[0].user_id, action: 'user.logout', entityType: 'user', entityId: rows[0].user_id });
             }
         } catch (err) {
             console.error('Logout event lookup failed (non-fatal):', err.message);
