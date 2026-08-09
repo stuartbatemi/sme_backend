@@ -5,16 +5,59 @@
 const express  = require('express');
 const bcrypt   = require('bcryptjs');
 const crypto   = require('crypto');
+const axios    = require('axios');
 const db       = require('../db');
 const { generateAccessToken, generateRefreshToken, verifyRefreshToken } = require('../utils/jwt');
 const { body, validationResult } = require('express-validator');
 
+const { sendMail, otpEmail, linkEmail } = require('../utils/mailer');
+const { sendSms, otpSms, normalizeTzPhone } = require('../utils/sms');
+
 const router = express.Router();
+
+const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY;
+const TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
 
 // ── Helper ────────────────────────────────────────────────────────
 function hashToken(token) {
     // We store a hash of the refresh token, not the raw token
     return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+// Verifies a Cloudflare Turnstile token server-side — the frontend
+// widget only proves a token *exists*; it can't be trusted on its own,
+// since anyone can forge a request without ever loading the widget.
+// The real check has to happen here, against Cloudflare's API, using
+// our secret key.
+//
+// If TURNSTILE_SECRET_KEY isn't configured (e.g. local dev without a
+// Cloudflare account set up yet), this fails OPEN — registration is
+// allowed to proceed without a bot check — rather than locking
+// everyone out of local development. In any real deployment, set
+// TURNSTILE_SECRET_KEY so this actually enforces the check.
+async function verifyTurnstile(token, remoteIp) {
+    if (!TURNSTILE_SECRET_KEY) {
+        return { ok: true, skipped: true };
+    }
+    if (!token) {
+        return { ok: false, skipped: false };
+    }
+    try {
+        const params = new URLSearchParams();
+        params.append('secret', TURNSTILE_SECRET_KEY);
+        params.append('response', token);
+        if (remoteIp) params.append('remoteip', remoteIp);
+
+        const { data } = await axios.post(TURNSTILE_VERIFY_URL, params, { timeout: 10000 });
+        return { ok: data?.success === true, skipped: false };
+    } catch (err) {
+        console.error('Turnstile verification request failed:', err.message);
+        // Cloudflare being unreachable shouldn't be indistinguishable
+        // from a failed human check, but it also shouldn't silently
+        // let bots through — treat a verification-service outage as a
+        // failed check and let the person retry.
+        return { ok: false, skipped: false };
+    }
 }
 
 // Records one row in login_events. Never throws — a logging failure
@@ -47,6 +90,8 @@ router.post('/register', [
     body('full_name').trim().isLength({ min: 2 }).withMessage('Name must be at least 2 characters'),
     body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
     body('password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters'),
+    body('terms_accepted').custom((value) => value === true || value === 'true')
+        .withMessage('You must accept the Terms of Service and Privacy Policy.'),
 ], async (req, res) => {
     // Validate inputs
     const errors = validationResult(req);
@@ -54,9 +99,17 @@ router.post('/register', [
         return res.status(400).json({ errors: errors.array() });
     }
 
-    const { full_name, email, password, phone, gender, age, district, ward, village } = req.body;
+    const {
+        full_name, email, password, phone, gender, age, district, ward, village,
+        marketing_opt_in, turnstile_token,
+    } = req.body;
 
     try {
+        const captcha = await verifyTurnstile(turnstile_token, req.ip);
+        if (!captcha.ok) {
+            return res.status(400).json({ error: 'Bot verification failed. Please try again.' });
+        }
+
         // Check if email already exists
         const [existing] = await db.query('SELECT id FROM users WHERE email = ?', [email]);
         if (existing.length > 0) {
@@ -69,11 +122,12 @@ router.post('/register', [
         // Insert new user (starts as 'regular' tier — upgrades via payment)
         const [result] = await db.query(
             `INSERT INTO users 
-             (full_name, email, password_hash, phone, gender, age, district, ward, village, tier)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'regular')`,
+             (full_name, email, password_hash, phone, gender, age, district, ward, village, tier, terms_accepted_at, marketing_opt_in)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'regular', NOW(), ?)`,
             [full_name, email, password_hash,
              phone || null, gender || null, age || null,
-             district || null, ward || null, village || null]
+             district || null, ward || null, village || null,
+             marketing_opt_in === true || marketing_opt_in === 'true']
         );
 
         const userId = result.insertId;
@@ -125,7 +179,7 @@ router.post('/login', [
         const [[{ recentFailures }]] = await db.query(
             `SELECT COUNT(*) AS recentFailures FROM login_events
              WHERE email_attempted = ? AND event_type = 'login_failed'
-               AND created_at > (NOW() - INTERVAL 15 MINUTE)`,
+               AND created_at > (UTC_TIMESTAMP() - INTERVAL 15 MINUTE)`,
             [email]
         );
         if (recentFailures >= 8) {
@@ -199,7 +253,7 @@ router.post('/refresh', async (req, res) => {
 
         // Check token exists and is not expired in DB
         const [rows] = await db.query(
-            'SELECT id, user_id FROM refresh_tokens WHERE token_hash = ? AND expires_at > NOW()',
+            'SELECT id, user_id FROM refresh_tokens WHERE token_hash = ? AND expires_at > UTC_TIMESTAMP()',
             [tokenHash]
         );
 
@@ -255,5 +309,190 @@ router.post('/logout', async (req, res) => {
     }
     return res.status(200).json({ message: 'Logged out successfully.' });
 });
+
+// ── POST /api/auth/forgot-password ────────────────────────────────
+// Body: { method: 'email_link' | 'email_otp' | 'sms_otp', email?, phone? }
+// email is required for email_link/email_otp; phone (+255...) for sms_otp.
+// Always responds with the same generic message whether or not the
+// account exists — this prevents attackers from using this endpoint
+// to discover which emails/phones are registered (user enumeration).
+router.post('/forgot-password', [
+    body('method').isIn(['email_link', 'email_otp', 'sms_otp']),
+    body('email').if(body('method').isIn(['email_link', 'email_otp'])).isEmail().normalizeEmail(),
+    body('phone').if(body('method').equals('sms_otp')).trim().isLength({ min: 9 }).withMessage('Enter a valid phone number'),
+], async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { method, email, phone } = req.body;
+    const GENERIC_RESPONSE = { message: 'If an account exists, we\u2019ve sent instructions.' };
+
+    try {
+        let user;
+        if (method === 'sms_otp') {
+            const target9 = normalizeTzPhone(phone).slice(-9);
+            const [rows] = await db.query(
+                `SELECT id, phone FROM users
+                 WHERE RIGHT(REPLACE(REPLACE(REPLACE(phone, '+', ''), ' ', ''), '-', ''), 9) = ?`,
+                [target9]
+            );
+            user = rows[0];
+        } else {
+            const [rows] = await db.query('SELECT id, email FROM users WHERE email = ?', [email]);
+            user = rows[0];
+        }
+
+        if (!user) {
+            // Don't reveal whether the account exists — respond the same either way.
+            return res.status(200).json(GENERIC_RESPONSE);
+        }
+
+        if (method === 'sms_otp') {
+            const otp = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+            const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+            await db.query(
+                `INSERT INTO password_resets (user_id, method, channel, code_hash, expires_at, ip_address)
+                 VALUES (?, 'otp', 'sms', ?, ?, ?)`,
+                [user.id, hashToken(otp), expiresAt, req.ip || null]
+            );
+
+            await sendSms(user.phone, otpSms(otp));
+        } else if (method === 'email_otp') {
+            const otp = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+            const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+            await db.query(
+                `INSERT INTO password_resets (user_id, method, channel, code_hash, expires_at, ip_address)
+                 VALUES (?, 'otp', 'email', ?, ?, ?)`,
+                [user.id, hashToken(otp), expiresAt, req.ip || null]
+            );
+
+            const { subject, html, text } = otpEmail(otp);
+            await sendMail({ to: user.email, subject, html, text });
+        } else {
+            const token = crypto.randomBytes(32).toString('hex');
+            const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes
+
+            await db.query(
+                `INSERT INTO password_resets (user_id, method, channel, code_hash, expires_at, ip_address)
+                 VALUES (?, 'link', 'email', ?, ?, ?)`,
+                [user.id, hashToken(token), expiresAt, req.ip || null]
+            );
+
+            const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/reset-password?token=${token}`;
+            const { subject, html, text } = linkEmail(resetUrl);
+            await sendMail({ to: user.email, subject, html, text });
+        }
+
+        return res.status(200).json(GENERIC_RESPONSE);
+    } catch (err) {
+        console.error('Forgot-password error:', err);
+        // Still respond generically — don't leak whether something broke
+        // for this specific account vs. it simply not existing.
+        return res.status(200).json(GENERIC_RESPONSE);
+    }
+});
+
+
+// ── POST /api/auth/reset-password/otp ─────────────────────────────
+// Body: { channel: 'email' | 'sms', email?, phone?, otp, new_password }
+router.post('/reset-password/otp', [
+    body('channel').isIn(['email', 'sms']),
+    body('email').if(body('channel').equals('email')).isEmail().normalizeEmail(),
+    body('phone').if(body('channel').equals('sms')).trim().isLength({ min: 9 }).withMessage('Enter a valid phone number'),
+    body('otp').trim().isLength({ min: 6, max: 6 }).withMessage('Enter the 6-digit code'),
+    body('new_password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters'),
+], async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { channel, email, phone, otp, new_password } = req.body;
+    const INVALID = { error: 'That code is invalid or has expired.' };
+
+    try {
+        let userId;
+        if (channel === 'sms') {
+            const target9 = normalizeTzPhone(phone).slice(-9);
+            const [userRows] = await db.query(
+                `SELECT id FROM users
+                 WHERE RIGHT(REPLACE(REPLACE(REPLACE(phone, '+', ''), ' ', ''), '-', ''), 9) = ?`,
+                [target9]
+            );
+            if (userRows.length === 0) return res.status(400).json(INVALID);
+            userId = userRows[0].id;
+        } else {
+            const [userRows] = await db.query('SELECT id FROM users WHERE email = ?', [email]);
+            if (userRows.length === 0) return res.status(400).json(INVALID);
+            userId = userRows[0].id;
+        }
+
+        const [resetRows] = await db.query(
+            `SELECT id FROM password_resets
+             WHERE user_id = ? AND method = 'otp' AND channel = ? AND code_hash = ?
+               AND used_at IS NULL AND expires_at > UTC_TIMESTAMP()
+             ORDER BY id DESC LIMIT 1`,
+            [userId, channel, hashToken(otp)]
+        );
+        if (resetRows.length === 0) {
+            return res.status(400).json(INVALID);
+        }
+
+        const password_hash = await bcrypt.hash(new_password, 12);
+        await db.query('UPDATE users SET password_hash = ? WHERE id = ?', [password_hash, userId]);
+        await db.query('UPDATE password_resets SET used_at = UTC_TIMESTAMP() WHERE id = ?', [resetRows[0].id]);
+        // Invalidate existing sessions so a stolen refresh token can't survive a reset.
+        await db.query('DELETE FROM refresh_tokens WHERE user_id = ?', [userId]);
+
+        return res.status(200).json({ message: 'Your password has been reset. You can now log in.' });
+    } catch (err) {
+        console.error('Reset-password (otp) error:', err);
+        return res.status(500).json({ error: 'Something went wrong. Please try again.' });
+    }
+});
+
+
+// ── POST /api/auth/reset-password/link ────────────────────────────
+// Body: { token, new_password }
+router.post('/reset-password/link', [
+    body('token').trim().notEmpty(),
+    body('new_password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters'),
+], async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { token, new_password } = req.body;
+
+    try {
+        const [resetRows] = await db.query(
+            `SELECT id, user_id FROM password_resets
+             WHERE method = 'link' AND code_hash = ?
+               AND used_at IS NULL AND expires_at > UTC_TIMESTAMP()
+             ORDER BY id DESC LIMIT 1`,
+            [hashToken(token)]
+        );
+        if (resetRows.length === 0) {
+            return res.status(400).json({ error: 'That link is invalid or has expired.' });
+        }
+        const userId = resetRows[0].user_id;
+
+        const password_hash = await bcrypt.hash(new_password, 12);
+        await db.query('UPDATE users SET password_hash = ? WHERE id = ?', [password_hash, userId]);
+        await db.query('UPDATE password_resets SET used_at = UTC_TIMESTAMP() WHERE id = ?', [resetRows[0].id]);
+        await db.query('DELETE FROM refresh_tokens WHERE user_id = ?', [userId]);
+
+        return res.status(200).json({ message: 'Your password has been reset. You can now log in.' });
+    } catch (err) {
+        console.error('Reset-password (link) error:', err);
+        return res.status(500).json({ error: 'Something went wrong. Please try again.' });
+    }
+});
+
 
 module.exports = router;

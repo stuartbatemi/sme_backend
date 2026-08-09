@@ -76,6 +76,30 @@ router.post('/predict', async (req, res) => {
             .filter(code => Number.isInteger(code));
     }
 
+    // For Path B, pull recent system-wide recommendation frequency so
+    // the model can softly de-weight over-shown activities. Best-effort:
+    // if this query fails for any reason, just skip the penalty rather
+    // than blocking the whole prediction on it.
+    if (path_type === 'B') {
+        try {
+            const [freqRows] = await db.query(
+                `SELECT isic_detailed, COUNT(*) as cnt
+                 FROM recommendation_events
+                 WHERE recommended_at > NOW() - INTERVAL 7 DAY
+                 GROUP BY isic_detailed
+                 ORDER BY cnt DESC
+                 LIMIT 30`
+            );
+            if (freqRows.length > 0) {
+                payload.frequency_penalty_isic = Object.fromEntries(
+                    freqRows.map(r => [r.isic_detailed, r.cnt])
+                );
+            }
+        } catch (freqErr) {
+            console.error('Frequency lookup failed (non-fatal):', freqErr.message);
+        }
+    }
+
     // Detect if this is a Premium user (optional auth) — Premium users get
     // routed to Lonet 2.5, the stronger/faster model.
     const { userId, userTier } = identifyUser(req);
@@ -90,6 +114,21 @@ router.post('/predict', async (req, res) => {
             headers: { 'Content-Type': 'application/json' }
         });
         result = response.data;
+
+        // Log what was actually shown, for future frequency-penalty
+        // queries — fire-and-forget, must never block/fail the response
+        // the user is waiting on.
+        if (path_type === 'B' && Array.isArray(result.recommendations)) {
+            const rows = result.recommendations
+                .filter(r => Number.isInteger(r.isic_detailed))
+                .map(r => [r.isic_detailed, payload.district || null]);
+            if (rows.length > 0) {
+                db.query(
+                    'INSERT INTO recommendation_events (isic_detailed, district) VALUES ?',
+                    [rows]
+                ).catch(logErr => console.error('Recommendation logging failed (non-fatal):', logErr.message));
+            }
+        }
     } catch (err) {
         if (err.code === 'ECONNREFUSED') {
             return res.status(503).json({ error: 'Advisory model is offline. Please try again shortly.' });
@@ -169,6 +208,7 @@ router.post('/predict', async (req, res) => {
     }
 
     // Save to DB if Premium user
+    let sessionSaved = false;
     if (userId && userTier === 'premium') {
         try {
             // Extract quick-access fields from result
@@ -218,15 +258,18 @@ router.post('/predict', async (req, res) => {
                     breakeven_months,
                 ]
             );
+            sessionSaved = true;
         } catch (dbErr) {
-            // Don't fail the request if DB save fails — just log it
+            // Don't fail the request if DB save fails — just log it.
+            // `saved` stays false so the frontend/caller isn't told a
+            // save succeeded when it actually didn't.
             console.error('Failed to save advisory session:', dbErr.message);
         }
     }
 
     return res.status(200).json({
         ...result,
-        saved: userId && userTier === 'premium' ? true : false,
+        saved: sessionSaved,
         model_tier: userTier === 'premium' ? 'premium' : 'regular',
     });
 });
@@ -326,6 +369,90 @@ router.get('/districts', async (req, res) => {
         }
         console.error('FastAPI /districts error:', err.message);
         return res.status(500).json({ error: 'Could not fetch districts.' });
+    }
+});
+
+
+// ── GET /api/advisory/sectors ────────────────────────────────────
+// Tier-aware proxy for the sector dropdown (Path A's "browse by
+// sector" narrowing, and Path B's "I know the sector but not the
+// specific business" filter). Same caching pattern as /districts.
+router.get('/sectors', async (req, res) => {
+    const { userTier } = identifyUser(req);
+    const modelBaseUrl = resolveModelBaseUrl(userTier);
+    const cacheKey = `sectors:${userTier}`;
+
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        res.set('Cache-Control', 'public, max-age=300');
+        return res.status(200).json(cached);
+    }
+
+    try {
+        const response = await axios.get(`${modelBaseUrl}/sectors`, { timeout: 10000 });
+        cache.set(cacheKey, response.data, 10 * 60 * 1000); // 10 min — basically static
+        res.set('Cache-Control', 'public, max-age=300');
+        return res.status(200).json(response.data);
+    } catch (err) {
+        if (err.code === 'ECONNREFUSED') {
+            return res.status(503).json({ error: 'Advisory model is offline. Please try again shortly.' });
+        }
+        console.error('FastAPI /sectors error:', err.message);
+        return res.status(500).json({ error: 'Could not fetch sectors.' });
+    }
+});
+
+
+// ── GET /api/advisory/skills ─────────────────────────────────────
+router.get('/skills', async (req, res) => {
+    const { userTier } = identifyUser(req);
+    const modelBaseUrl = resolveModelBaseUrl(userTier);
+    const cacheKey = `skills:${userTier}`;
+
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        res.set('Cache-Control', 'public, max-age=300');
+        return res.status(200).json(cached);
+    }
+
+    try {
+        const response = await axios.get(`${modelBaseUrl}/skills`, { timeout: 10000 });
+        cache.set(cacheKey, response.data, 10 * 60 * 1000);
+        res.set('Cache-Control', 'public, max-age=300');
+        return res.status(200).json(response.data);
+    } catch (err) {
+        if (err.code === 'ECONNREFUSED') {
+            return res.status(503).json({ error: 'Advisory model is offline. Please try again shortly.' });
+        }
+        console.error('FastAPI /skills error:', err.message);
+        return res.status(500).json({ error: 'Could not fetch skills.' });
+    }
+});
+
+
+// ── GET /api/advisory/hobbies ────────────────────────────────────
+router.get('/hobbies', async (req, res) => {
+    const { userTier } = identifyUser(req);
+    const modelBaseUrl = resolveModelBaseUrl(userTier);
+    const cacheKey = `hobbies:${userTier}`;
+
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        res.set('Cache-Control', 'public, max-age=300');
+        return res.status(200).json(cached);
+    }
+
+    try {
+        const response = await axios.get(`${modelBaseUrl}/hobbies`, { timeout: 10000 });
+        cache.set(cacheKey, response.data, 10 * 60 * 1000);
+        res.set('Cache-Control', 'public, max-age=300');
+        return res.status(200).json(response.data);
+    } catch (err) {
+        if (err.code === 'ECONNREFUSED') {
+            return res.status(503).json({ error: 'Advisory model is offline. Please try again shortly.' });
+        }
+        console.error('FastAPI /hobbies error:', err.message);
+        return res.status(500).json({ error: 'Could not fetch hobbies.' });
     }
 });
 

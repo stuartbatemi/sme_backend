@@ -21,7 +21,14 @@ const router = express.Router();
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL = 'llama-3.3-70b-versatile'; // free tier, strong reasoning, fast
+// groq/compound is Groq's agentic "compound system" — it wraps a strong
+// underlying model (GPT-OSS-120B / Llama 4 Scout / Llama 3.3 70B) with
+// real built-in tools, including live web search (via Tavily), and can
+// make multiple tool calls in a single request. Using this instead of a
+// plain chat model is what lets this endpoint name *actual* nearby
+// businesses instead of the model guessing from training data alone.
+// Docs: https://console.groq.com/docs/compound
+const GROQ_MODEL = 'groq/compound';
 
 function buildPrompt({ activity, sector, district, ward, capital_tzs, monthly_profit,
                         success_chance, existing_similar_businesses_in_area, roi_percent,
@@ -38,7 +45,7 @@ Location: ${ward ? ward + ', ' : ''}${district}, Dar es Salaam
 Starting capital: TZS ${Number(capital_tzs).toLocaleString()}
 Model-predicted monthly profit: TZS ${Number(monthly_profit).toLocaleString()}
 Model-predicted success category: ${success_chance}
-Existing similar businesses already in this area: ${existing_similar_businesses_in_area}
+Existing similar businesses already in this area (from census/registry data): ${existing_similar_businesses_in_area}
 ${roi_percent ? `Predicted annual ROI: ${roi_percent}%` : ''}
 ${breakeven_months ? `Predicted breakeven: ${breakeven_months} months` : ''}
 
@@ -46,6 +53,13 @@ The prediction above was generated from historical business-registry and census 
 (location, capital tier, sector saturation). It does NOT account for real-world factors
 like seasonality, competitor behavior, supplier reliability, regulatory changes, weather/
 rainy-season effects on foot traffic, or currency/import cost shifts.
+
+Before answering, use your web search tool to look for REAL, currently-listed businesses
+doing "${activity}" (or the closest matching category) in or near ${ward ? ward + ', ' : ''}${district},
+Dar es Salaam — e.g. via Google Maps/Places listings, TripAdvisor, local directories, or
+news articles that name specific operators in that area. You are looking for concrete
+examples of the competition this person would actually encounter, not a generic industry
+description.
 
 ${languageInstruction}
 
@@ -56,7 +70,8 @@ Respond in JSON only, matching this exact structure, no markdown fences, no prea
   "twelve_month_outlook": "2-3 sentences on the one-year picture, being honest about risks not captured in the data",
   "first_30_days": ["4-6 short, concrete, ordered first steps to actually launch this specific business in this specific location"],
   "supplier_guidance": "2-3 sentences of GENERAL guidance on what type of suppliers/wholesalers this business typically needs and where in Dar es Salaam that category of supplier is commonly found (e.g. Kariakoo for general retail goods) — do not name specific company names, since you cannot verify current, real, operating suppliers",
-  "risk_factors_outside_the_model": ["3-4 short bullet points naming specific real-world risks NOT captured by location/capital/saturation data alone"]
+  "risk_factors_outside_the_model": ["3-4 short bullet points naming specific real-world risks NOT captured by location/capital/saturation data alone"],
+  "real_world_competition": ["3-5 items. Each item should name a REAL business you found via web search that this person would realistically compete with in or near this area, with a short note on what makes it relevant (e.g. 'XYZ Electronics, Kariakoo — established phone-accessories retailer with strong foot traffic'). If your search genuinely turns up nothing specific and verifiable for this exact activity/area, do NOT invent a business name — instead return a SINGLE item honestly stating that no specific verifiable listings were found for this area and describing the general competitive landscape from whatever your search did surface (e.g. broader district-level trends, directory category counts, or news coverage). Never fabricate a business name, address, or rating."]
 }`;
 }
 
@@ -85,32 +100,82 @@ router.post('/analyze', async (req, res) => {
     });
   }
 
-  try {
-    const response = await axios.post(
-      GROQ_URL,
+  // Compound systems are agentic (they run a web-search tool loop before
+  // answering), which needs more headroom than a plain chat call — both
+  // in tokens (search results get folded into context) and in wall-clock
+  // time (search + synthesis, not just generation).
+  const requestBody = {
+    model: GROQ_MODEL,
+    messages: [
       {
-        model: GROQ_MODEL,
-        messages: [
-          { role: 'system', content: 'You are a precise, honest business advisor. You always respond with valid JSON only, no other text.' },
-          { role: 'user', content: buildPrompt(req.body) },
-        ],
-        temperature: 0.4,
-        max_tokens: 1000,
-        response_format: { type: 'json_object' },
+        role: 'system',
+        content: 'You are a precise, honest business advisor with live web search. ' +
+          'Use web search to find real, currently-listed competing businesses before ' +
+          'answering. Respond with valid JSON only, no markdown fences, no preamble, ' +
+          'no commentary about the search itself — just the JSON object.',
       },
+      { role: 'user', content: buildPrompt(req.body) },
+    ],
+    temperature: 0.4,
+    max_tokens: 1800,
+  };
+
+  // Extracts a JSON object from the model's reply even if it ignored the
+  // "no preamble" instruction and wrapped the JSON in prose or fences —
+  // compound systems narrate tool use more often than plain chat models.
+  function extractJson(raw) {
+    if (!raw) throw new Error('empty response');
+    try {
+      return JSON.parse(raw);
+    } catch {
+      const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      if (fenced) {
+        try { return JSON.parse(fenced[1]); } catch { /* fall through */ }
+      }
+      const start = raw.indexOf('{');
+      const end = raw.lastIndexOf('}');
+      if (start !== -1 && end > start) {
+        return JSON.parse(raw.slice(start, end + 1));
+      }
+      throw new Error('no JSON object found in response');
+    }
+  }
+
+  async function callGroq(withJsonMode) {
+    return axios.post(
+      GROQ_URL,
+      withJsonMode ? { ...requestBody, response_format: { type: 'json_object' } } : requestBody,
       {
         headers: {
           'Authorization': `Bearer ${GROQ_API_KEY}`,
           'Content-Type': 'application/json',
         },
-        timeout: 20000,
+        timeout: 35000,
       }
     );
+  }
+
+  try {
+    // groq/compound is an agentic "system", not a plain chat model —
+    // some Groq compound versions reject response_format alongside
+    // built-in tool use. Try the stricter JSON mode first, and fall
+    // back to prompt-only JSON (parsed defensively via extractJson)
+    // if the API rejects that combination.
+    let response;
+    try {
+      response = await callGroq(true);
+    } catch (jsonModeErr) {
+      if (jsonModeErr.response?.status === 400) {
+        response = await callGroq(false);
+      } else {
+        throw jsonModeErr;
+      }
+    }
 
     const raw = response.data?.choices?.[0]?.message?.content;
     let parsed;
     try {
-      parsed = JSON.parse(raw);
+      parsed = extractJson(raw);
     } catch (parseErr) {
       console.error('Consultant JSON parse failed:', raw);
       return res.status(502).json({
@@ -123,8 +188,8 @@ router.post('/analyze', async (req, res) => {
     return res.status(200).json({
       ...parsed,
       generated_by: isSw
-        ? 'Mshauri wa AI (ushauri wa jumla, haujathibitishwa eneo — hakiki kabla ya kutegemea)'
-        : 'AI consultant (general guidance, not location-verified — cross-check before relying on it)',
+        ? 'Mshauri wa AI (pamoja na utafutaji wa mtandaoni kwa ushindani halisi — bado hakiki kabla ya kutegemea)'
+        : 'AI consultant, with live web search for real competitors — cross-check specifics before relying on them',
     });
 
   } catch (err) {
