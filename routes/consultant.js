@@ -29,6 +29,10 @@ const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 // businesses instead of the model guessing from training data alone.
 // Docs: https://console.groq.com/docs/compound
 const GROQ_MODEL = 'groq/compound';
+// Lighter/faster variant of the same agentic system — used as a fallback
+// if the full compound model's request (prompt + tool-call context from
+// web search) exceeds Groq's request-size cap. See the 413 handling below.
+const GROQ_MODEL_FALLBACK = 'groq/compound-mini';
 
 function buildPrompt({ activity, sector, district, ward, capital_tzs, monthly_profit,
                         success_chance, existing_similar_businesses_in_area, roi_percent,
@@ -141,10 +145,19 @@ router.post('/analyze', async (req, res) => {
     }
   }
 
-  async function callGroq(withJsonMode) {
+  async function callGroq(withJsonMode, model = GROQ_MODEL) {
+    const body = { ...requestBody, model };
+    // Visibility for the exact "Request Entity Too Large" failure we've
+    // seen in prod — logs the real outgoing byte size so we can tell,
+    // next time it happens, whether our own prompt genuinely grew huge
+    // or whether this is Groq-side (web-search tool results folded into
+    // context pushing an unrelated-looking small request over the cap).
+    const finalBody = withJsonMode ? { ...body, response_format: { type: 'json_object' } } : body;
+    const byteSize = Buffer.byteLength(JSON.stringify(finalBody), 'utf8');
+    console.log(`Groq request (model=${model}, jsonMode=${withJsonMode}): ${byteSize} bytes`);
     return axios.post(
       GROQ_URL,
-      withJsonMode ? { ...requestBody, response_format: { type: 'json_object' } } : requestBody,
+      finalBody,
       {
         headers: {
           'Authorization': `Bearer ${GROQ_API_KEY}`,
@@ -161,11 +174,30 @@ router.post('/analyze', async (req, res) => {
     // built-in tool use. Try the stricter JSON mode first, and fall
     // back to prompt-only JSON (parsed defensively via extractJson)
     // if the API rejects that combination.
+    //
+    // 413 (request_too_large) gets its own fallback: retry once against
+    // groq/compound-mini, a lighter variant of the same agentic system.
+    // This is the actual error we saw in prod (see Railway logs,
+    // 2026-08-09) — our own prompt is short, so the size almost
+    // certainly comes from compound's built-in web-search tool folding
+    // a large fetched page into context before answering. compound-mini
+    // is more likely to stay under the cap for the same query.
     let response;
     try {
       response = await callGroq(true);
     } catch (jsonModeErr) {
-      if (jsonModeErr.response?.status === 400) {
+      if (jsonModeErr.response?.status === 413) {
+        console.warn('Groq 413 on groq/compound — retrying with groq/compound-mini');
+        try {
+          response = await callGroq(true, GROQ_MODEL_FALLBACK);
+        } catch (miniErr) {
+          if (miniErr.response?.status === 400) {
+            response = await callGroq(false, GROQ_MODEL_FALLBACK);
+          } else {
+            throw miniErr;
+          }
+        }
+      } else if (jsonModeErr.response?.status === 400) {
         response = await callGroq(false);
       } else {
         throw jsonModeErr;
@@ -194,7 +226,12 @@ router.post('/analyze', async (req, res) => {
 
   } catch (err) {
     if (err.response) {
-      console.error('Groq API error:', err.response.status, err.response.data);
+      console.error(
+        'Groq API error:', err.response.status, err.response.data,
+        err.response.status === 413
+          ? '(413 persisted even after the compound-mini fallback — genuinely too large, not just a compound-vs-mini difference)'
+          : ''
+      );
       return res.status(502).json({
         error: isSw
           ? 'Huduma ya mshauri wa AI imerudisha hitilafu. Tafadhali jaribu tena.'
